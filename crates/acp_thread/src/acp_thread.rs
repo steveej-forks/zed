@@ -2263,6 +2263,7 @@ impl AcpThread {
                     }
                     Err(e) => {
                         Self::flush_streaming_text(&mut this.streaming_text_buffer, cx);
+                        this.mark_unfinished_tools_as_failed(&e.to_string(), cx);
 
                         this.had_error = true;
                         cx.emit(AcpThreadEvent::Error);
@@ -2302,6 +2303,40 @@ impl AcpThread {
                     call.status = ToolCallStatus::Canceled;
                 }
             }
+        }
+    }
+
+    fn mark_unfinished_tools_as_failed(&mut self, error: &str, cx: &mut Context<Self>) {
+        let language_registry = self.project.read(cx).languages().clone();
+        let path_style = self.project.read(cx).path_style(cx);
+
+        for (ix, entry) in self.entries.iter_mut().enumerate() {
+            let AgentThreadEntry::ToolCall(call) = entry else {
+                continue;
+            };
+
+            let fail = matches!(
+                call.status,
+                ToolCallStatus::Pending
+                    | ToolCallStatus::WaitingForConfirmation { .. }
+                    | ToolCallStatus::InProgress
+            );
+
+            if !fail {
+                continue;
+            }
+
+            call.status = ToolCallStatus::Failed;
+            if call.content.is_empty() {
+                call.content
+                    .push(ToolCallContent::ContentBlock(ContentBlock::new(
+                        error.into(),
+                        &language_registry,
+                        path_style,
+                        cx,
+                    )));
+            }
+            cx.emit(AcpThreadEvent::EntryUpdated(ix));
         }
     }
 
@@ -4977,6 +5012,86 @@ mod tests {
                 matches!(tool_entry.status, ToolCallStatus::Canceled),
                 "tool should be marked as Canceled when response is Cancelled, got {:?}",
                 tool_entry.status
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_send_error_marks_unfinished_tools_as_failed(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message(
+            move |_params, thread, mut cx| {
+                async move {
+                    thread
+                        .update(&mut cx, |thread, cx| {
+                            thread.handle_session_update(
+                                acp::SessionUpdate::ToolCall(
+                                    acp::ToolCall::new(
+                                        acp::ToolCallId::new("test-tool"),
+                                        "Test Tool",
+                                    )
+                                    .kind(acp::ToolKind::Edit)
+                                    .status(acp::ToolCallStatus::InProgress),
+                                ),
+                                cx,
+                            )
+                        })
+                        .unwrap()
+                        .unwrap();
+
+                    Err(anyhow!("server shut down unexpectedly"))
+                }
+                .boxed_local()
+            },
+        ));
+
+        let thread = cx
+            .update(|cx| connection.new_session(project, Path::new(path!("/test")), cx))
+            .await
+            .unwrap();
+
+        let response = thread
+            .update(cx, |thread, cx| thread.send_raw("test message", cx))
+            .await;
+
+        assert!(
+            response.is_err(),
+            "send should fail when the agent turn errors"
+        );
+
+        thread.read_with(cx, |thread, cx| {
+            assert!(thread.had_error(), "thread should record the turn error");
+            assert!(
+                !thread.has_in_progress_tool_calls(),
+                "unfinished tool calls should not keep the thread waiting"
+            );
+
+            let tool_entry = thread
+                .entries
+                .iter()
+                .find_map(|e| {
+                    if let AgentThreadEntry::ToolCall(call) = e {
+                        Some(call)
+                    } else {
+                        None
+                    }
+                })
+                .expect("should have tool call entry");
+
+            assert!(
+                matches!(tool_entry.status, ToolCallStatus::Failed),
+                "tool should be marked as Failed when response errors, got {:?}",
+                tool_entry.status
+            );
+            assert!(
+                tool_entry
+                    .to_markdown(cx)
+                    .contains("server shut down unexpectedly"),
+                "failed tool should retain an error message"
             );
         });
     }
