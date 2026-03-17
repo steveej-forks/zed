@@ -3,7 +3,8 @@ use buffer_diff::BufferDiff;
 use gpui::{App, AppContext, AsyncApp, Context, Entity, Subscription, Task};
 use itertools::Itertools;
 use language::{
-    Anchor, Buffer, Capability, LanguageRegistry, OffsetRangeExt as _, Point, TextBuffer,
+    Anchor, Buffer, Capability, LanguageRegistry, OffsetRangeExt as _, PLAIN_TEXT, Point,
+    TextBuffer,
 };
 use multi_buffer::{MultiBuffer, PathKey, excerpt_context_lines};
 use std::{cmp::Reverse, ops::Range, path::Path, sync::Arc};
@@ -33,7 +34,8 @@ impl Diff {
                 let language = language_registry
                     .load_language_for_file_path(Path::new(&path))
                     .await
-                    .log_err();
+                    .warn_on_err()
+                    .or_else(|| Some(PLAIN_TEXT.clone()));
 
                 buffer.update(cx, |buffer, cx| buffer.set_language(language.clone(), cx));
                 buffer.update(cx, |buffer, _| buffer.parsing_idle()).await;
@@ -438,7 +440,8 @@ async fn build_buffer_diff(
 #[cfg(test)]
 mod tests {
     use gpui::{AppContext as _, TestAppContext};
-    use language::Buffer;
+    use language::{Buffer, LanguageRegistry};
+    use std::sync::Arc;
 
     use crate::Diff;
 
@@ -450,5 +453,30 @@ mod tests {
             buffer.set_text("HELLO!", cx);
         });
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_finalized_diff_falls_back_to_plain_text_for_unknown_path(
+        cx: &mut TestAppContext,
+    ) {
+        let language_registry = Arc::new(LanguageRegistry::test(cx.executor()));
+        let diff = cx.new(|cx| {
+            Diff::finalized(
+                "scratch.unknown".into(),
+                Some("hello!\n".into()),
+                "HELLO!\n".into(),
+                language_registry,
+                cx,
+            )
+        });
+
+        cx.run_until_parked();
+
+        let has_revealed_range = diff.read_with(cx, |diff, cx| diff.has_revealed_range(cx));
+        let markdown = diff.read_with(cx, |diff, cx| diff.to_markdown(cx));
+
+        assert!(has_revealed_range);
+        assert!(markdown.contains("scratch.unknown"));
+        assert!(markdown.contains("HELLO!"));
     }
 }
