@@ -676,6 +676,7 @@ impl ThreadView {
             ViewEvent::NewDiff(tool_call_id) => {
                 if AgentSettings::get_global(cx).expand_edit_card {
                     self.expanded_tool_calls.insert(tool_call_id.clone());
+                    cx.notify();
                 }
             }
             ViewEvent::NewTerminal(tool_call_id) => {
@@ -6828,18 +6829,16 @@ impl ThreadView {
             &tool_call.status,
             ToolCallStatus::InProgress | ToolCallStatus::Pending
         );
-
-        let revealed_diff_editor = if let Some(entry) =
-            self.entry_view_state.read(cx).entry(entry_ix)
+        let diff_editor = if let Some(entry) = self.entry_view_state.read(cx).entry(entry_ix)
             && let Some(editor) = entry.editor_for_diff(diff)
-            && diff.read(cx).has_revealed_range(cx)
         {
             Some(editor)
         } else {
             None
         };
+        let has_revealed_diff = diff.read(cx).has_revealed_range(cx);
 
-        let show_top_border = !has_failed || revealed_diff_editor.is_some();
+        let show_top_border = !has_failed || diff_editor.is_some();
 
         v_flex()
             .h_full()
@@ -6848,9 +6847,13 @@ impl ThreadView {
                     .when(has_failed, |this| this.border_dashed())
                     .border_color(self.tool_card_border_color(cx))
             })
-            .child(if let Some(editor) = revealed_diff_editor {
-                editor.into_any_element()
-            } else if tool_progress && self.as_native_connection(cx).is_some() {
+            .child(if let Some(editor) = diff_editor {
+                if has_revealed_diff {
+                    editor.into_any_element()
+                } else {
+                    self.render_diff_loading(cx)
+                }
+            } else if tool_progress {
                 self.render_diff_loading(cx)
             } else {
                 Empty.into_any()
