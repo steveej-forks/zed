@@ -1223,6 +1223,7 @@ struct WorkspaceThread {
     thread: WeakEntity<AcpThread>,
     _thread_subscriptions: (Subscription, Subscription),
     singleton_editors: HashMap<WeakEntity<Buffer>, HashMap<WeakEntity<Editor>, Subscription>>,
+    reviewed_buffers: HashSet<WeakEntity<Buffer>>,
     _settings_subscription: Subscription,
     _workspace_subscription: Option<Subscription>,
 }
@@ -1230,6 +1231,19 @@ struct WorkspaceThread {
 struct AgentDiffGlobal(Entity<AgentDiff>);
 
 impl Global for AgentDiffGlobal {}
+
+fn reviewed_buffer_delta(
+    previous: &HashSet<WeakEntity<Buffer>>,
+    current: &HashSet<WeakEntity<Buffer>>,
+) -> Option<(Vec<WeakEntity<Buffer>>, Vec<WeakEntity<Buffer>>)> {
+    if previous == current {
+        return None;
+    }
+
+    let entered_buffers = current.difference(previous).cloned().collect::<Vec<_>>();
+    let removed_buffers = previous.difference(current).cloned().collect::<Vec<_>>();
+    Some((entered_buffers, removed_buffers))
+}
 
 impl AgentDiff {
     fn global(cx: &mut App) -> Entity<Self> {
@@ -1266,7 +1280,7 @@ impl AgentDiff {
         let action_log_subscription = cx.observe_in(&action_log, window, {
             let workspace = workspace.clone();
             move |this, _action_log, window, cx| {
-                this.update_reviewing_editors(&workspace, window, cx);
+                this.update_reviewing_editors_if_changed_buffers_changed(&workspace, window, cx);
             }
         });
 
@@ -1307,6 +1321,7 @@ impl AgentDiff {
                 thread: thread.downgrade(),
                 _thread_subscriptions: (action_log_subscription, thread_subscription),
                 singleton_editors: HashMap::default(),
+                reviewed_buffers: HashSet::default(),
                 _settings_subscription: settings_subscription,
                 _workspace_subscription: workspace_subscription,
             },
@@ -1495,6 +1510,157 @@ impl AgentDiff {
         self.update_reviewing_editors(&workspace, window, cx);
     }
 
+    fn update_reviewing_editors_if_changed_buffers_changed(
+        &mut self,
+        workspace: &WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !AgentSettings::get_global(cx).single_file_review {
+            return;
+        }
+
+        let Some((thread, entered_buffers, removed_buffers)) = ({
+            let Some(workspace_thread) = self.workspace_threads.get_mut(workspace) else {
+                return;
+            };
+
+            let Some(thread) = workspace_thread.thread.upgrade() else {
+                return;
+            };
+
+            let changed_buffers = thread.read(cx).action_log().read(cx).changed_buffers(cx);
+            let reviewed_buffers = changed_buffers
+                .keys()
+                .filter(|buffer| buffer.read(cx).file().is_some())
+                .map(|buffer| buffer.downgrade())
+                .collect::<HashSet<_>>();
+
+            reviewed_buffer_delta(&workspace_thread.reviewed_buffers, &reviewed_buffers).map(
+                |(entered_reviewed_buffers, removed_buffers)| {
+                    let entered_buffers = changed_buffers
+                        .iter()
+                        .filter(|(buffer, _)| {
+                            entered_reviewed_buffers.contains(&buffer.downgrade())
+                        })
+                        .map(|(buffer, diff_handle)| (buffer.clone(), diff_handle.clone()))
+                        .collect::<Vec<_>>();
+                    workspace_thread.reviewed_buffers = reviewed_buffers;
+                    (thread, entered_buffers, removed_buffers)
+                },
+            )
+        }) else {
+            return;
+        };
+
+        self.remove_reviewing_editors_for_buffers(workspace, removed_buffers, cx);
+        self.add_reviewing_editors_for_buffers(workspace, thread, entered_buffers, window, cx);
+        cx.notify();
+    }
+
+    fn add_reviewing_editors_for_buffers(
+        &mut self,
+        workspace: &WeakEntity<Workspace>,
+        thread: Entity<AcpThread>,
+        entered_buffers: Vec<(Entity<Buffer>, Entity<buffer_diff::BufferDiff>)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace_thread) = self.workspace_threads.get(workspace) else {
+            return;
+        };
+
+        let mut entered_editors = Vec::new();
+        for (buffer, diff_handle) in entered_buffers {
+            let Some(buffer_editors) = workspace_thread.singleton_editors.get(&buffer.downgrade())
+            else {
+                continue;
+            };
+
+            for weak_editor in buffer_editors.keys() {
+                let Some(editor) = weak_editor.upgrade() else {
+                    continue;
+                };
+                entered_editors.push((weak_editor.clone(), editor, diff_handle.clone()));
+            }
+        }
+
+        for (weak_editor, editor, diff_handle) in entered_editors {
+            let multibuffer = editor.read(cx).buffer().clone();
+            multibuffer.update(cx, |multibuffer, cx| {
+                multibuffer.add_diff(diff_handle.clone(), cx);
+            });
+
+            let reviewing_state = EditorState::Reviewing;
+            let previous_state = self
+                .reviewing_editors
+                .insert(weak_editor.clone(), reviewing_state.clone());
+
+            if previous_state.is_none() {
+                editor.update(cx, |editor, cx| {
+                    editor.start_temporary_diff_override();
+                    editor.set_render_diff_hunk_controls(
+                        diff_hunk_controls(&thread, workspace.clone()),
+                        cx,
+                    );
+                    editor.set_expand_all_diff_hunks(cx);
+                    editor.register_addon(EditorAgentDiffAddon);
+                });
+            }
+
+            if reviewing_state == EditorState::Reviewing && previous_state != Some(reviewing_state)
+            {
+                editor.update(cx, |editor, cx| {
+                    let snapshot = multibuffer.read(cx).snapshot(cx);
+                    if let Some(first_hunk) = snapshot.diff_hunks().next() {
+                        let first_hunk_start = first_hunk.multi_buffer_range().start;
+
+                        editor.change_selections(
+                            SelectionEffects::scroll(Autoscroll::center()),
+                            window,
+                            cx,
+                            |selections| {
+                                selections.select_ranges([first_hunk_start..first_hunk_start])
+                            },
+                        );
+                    }
+                });
+            }
+        }
+    }
+
+    fn remove_reviewing_editors_for_buffers(
+        &mut self,
+        workspace: &WeakEntity<Workspace>,
+        removed_buffers: Vec<WeakEntity<Buffer>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace_thread) = self.workspace_threads.get(workspace) else {
+            return;
+        };
+
+        let mut removed_editors = Vec::new();
+        for buffer in removed_buffers {
+            let Some(buffer_editors) = workspace_thread.singleton_editors.get(&buffer) else {
+                continue;
+            };
+
+            for weak_editor in buffer_editors.keys() {
+                if let Some(editor) = weak_editor.upgrade() {
+                    removed_editors.push((weak_editor.clone(), editor));
+                }
+            }
+        }
+
+        for (weak_editor, editor) in removed_editors {
+            editor.update(cx, |editor, cx| {
+                editor.end_temporary_diff_override(cx);
+                editor.unregister_addon::<EditorAgentDiffAddon>();
+            });
+            self.reviewing_editors.remove(&weak_editor);
+        }
+    }
+
     fn update_reviewing_editors(
         &mut self,
         workspace: &WeakEntity<Workspace>,
@@ -1523,6 +1689,11 @@ impl AgentDiff {
 
         let action_log = thread.read(cx).action_log();
         let changed_buffers = action_log.read(cx).changed_buffers(cx);
+        workspace_thread.reviewed_buffers = changed_buffers
+            .keys()
+            .filter(|buffer| buffer.read(cx).file().is_some())
+            .map(|buffer| buffer.downgrade())
+            .collect();
 
         let mut unaffected = self.reviewing_editors.clone();
 
@@ -2242,6 +2413,17 @@ mod tests {
             .read_with(cx, |editor, cx| editor.project_path(cx))
             .unwrap();
         assert_eq!(editor2_path, buffer_path2);
+        assert!(diff_toolbar.read_with(cx, |toolbar, _cx| matches!(
+            toolbar.active_item,
+            Some(AgentDiffToolbarItem::Editor {
+                state: EditorState::Reviewing,
+                ..
+            })
+        )));
+        assert_eq!(
+            diff_toolbar.read_with(cx, |toolbar, cx| toolbar.location(cx)),
+            ToolbarItemLocation::PrimaryRight
+        );
 
         assert_eq!(
             editor2.read_with(cx, |editor, cx| editor.text(cx)),
@@ -2272,6 +2454,49 @@ mod tests {
             diff_toolbar.read_with(cx, |toolbar, cx| toolbar.location(cx)),
             ToolbarItemLocation::Hidden
         );
+    }
+
+    #[gpui::test]
+    async fn test_reviewed_buffer_delta_tracks_entered_and_removed_buffers(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/test"), json!({"file1": "abc", "file2": "def"}))
+            .await;
+        let project = Project::test(fs, [path!("/test").as_ref()], cx).await;
+
+        let buffer1 = project
+            .update(cx, |project, cx| {
+                let path = project.find_project_path("test/file1", cx).unwrap();
+                project.open_buffer(path, cx)
+            })
+            .await
+            .unwrap();
+        let buffer2 = project
+            .update(cx, |project, cx| {
+                let path = project.find_project_path("test/file2", cx).unwrap();
+                project.open_buffer(path, cx)
+            })
+            .await
+            .unwrap();
+
+        let previous = HashSet::from_iter([buffer1.downgrade(), buffer2.downgrade()]);
+        let current = HashSet::from_iter([buffer2.downgrade()]);
+
+        let (entered, removed) = reviewed_buffer_delta(&previous, &current).unwrap();
+        assert!(entered.is_empty());
+        assert_eq!(removed, vec![buffer1.downgrade()]);
+
+        let (entered, removed) = reviewed_buffer_delta(&current, &previous).unwrap();
+        assert_eq!(entered, vec![buffer1.downgrade()]);
+        assert!(removed.is_empty());
+
+        assert!(reviewed_buffer_delta(&previous, &previous).is_none());
     }
 
     fn override_toolbar_agent_review_setting(active: bool, cx: &mut VisualTestContext) {
